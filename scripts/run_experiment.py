@@ -170,6 +170,9 @@ def main():
     ap.add_argument('--backbone', default='mit_b1', choices=['mit_b0', 'mit_b1', 'mit_b2', 'mit_b3', 'mit_b4'])
     ap.add_argument('--modalities', default='rgb,thermal,event')
     ap.add_argument('--train-subset', default='all', choices=['all', 'day', 'night'])
+    ap.add_argument('--stats-from', default='train', choices=['train', 'train_all'],
+                    help="paper 모드의 열화상/이벤트 정규화 통계: train = 실제 학습에 쓰는 이미지(낮만이면 낮만), "
+                         "train_all = 학습 split 전체 7,800장 (모든 실험이 같은 통계)")
     ap.add_argument('--epochs', type=int, default=15)
     ap.add_argument('--batch-size', type=int, default=16, help='한 번에 GPU에 올리는 이미지 수')
     ap.add_argument('--accum', type=int, default=1,
@@ -207,13 +210,15 @@ def main():
     base = NpyYoloDataset(cfg.image_dir, cfg.label_dir, mode='all')
     train_files, test_files = train_test_split(base.image_files, test_size=cfg.test_size,
                                                random_state=cfg.random_state)
+    train_files_all = list(train_files)
     if args.train_subset != 'all':
         prefix = SUBSETS[args.train_subset]
         train_files = [f for f in train_files if f.startswith(prefix)]
 
     # ---- normalization / resolution
     if paper:
-        aux_mean, aux_std = compute_aux_stats(cfg.image_dir, train_files, args.stats_samples, args.seed)
+        stats_files = train_files_all if args.stats_from == 'train_all' else train_files
+        aux_mean, aux_std = compute_aux_stats(cfg.image_dir, stats_files, args.stats_samples, args.seed)
         image_mean = [0.485, 0.456, 0.406] + aux_mean
         image_std = [0.229, 0.224, 0.225] + aux_std
         scale, min_size, max_size = 1.0 / 255.0, 301, 391
@@ -236,7 +241,7 @@ def main():
         'name': args.name, 'setting': args.setting, 'backbone': args.backbone, 'modalities': modalities,
         'train_subset': args.train_subset, 'epochs': args.epochs, 'batch_size': args.batch_size,
         'accum': args.accum, 'effective_batch': eff_batch, 'lr': lr,
-        'amp': amp, 'min_size': min_size, 'max_size': max_size,
+        'amp': amp, 'min_size': min_size, 'max_size': max_size, 'stats_from': args.stats_from,
         'image_mean': [round(x, 4) for x in image_mean], 'image_std': [round(x, 4) for x in image_std],
         'num_train': len(train_files), 'num_test': len(test_files), 'params_M': round(n_params, 2),
         'device': str(device), 'gpu': torch.cuda.get_device_name(0) if device.type == 'cuda' else None,
