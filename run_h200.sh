@@ -17,7 +17,7 @@ echo "[info] experiment=$EXP  out=$OUT_ROOT  host=$(hostname)"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || echo "[info] nvidia-smi 없음"
 
 # ---------------------------------------------------------------- 패키지
-python - <<'PY' || pip install -q torchmetrics pycocotools gdown
+python - <<'PY' || pip install -q torchmetrics pycocotools gdown scikit-learn
 import importlib, sys
 missing = [m for m in ("torchmetrics", "pycocotools", "gdown", "sklearn") if importlib.util.find_spec(m) is None]
 sys.exit(1 if missing else 0)
