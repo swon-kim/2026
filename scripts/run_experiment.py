@@ -159,6 +159,9 @@ def evaluate(model, loader, files, device, amp, max_images=None):
 
 # --------------------------------------------------------------------------- main
 def main():
+    # 컨테이너에서 DataLoader worker 간 텐서 전달이 끊기는 문제("received 0 items of ancdata") 방지
+    torch.multiprocessing.set_sharing_strategy('file_system')
+
     ap = argparse.ArgumentParser()
     ap.add_argument('--name', required=True, help='실험 이름 (출력 폴더명)')
     ap.add_argument('--data', required=True, help='images/ 와 labels/ 가 있는 폴더')
@@ -168,8 +171,10 @@ def main():
     ap.add_argument('--modalities', default='rgb,thermal,event')
     ap.add_argument('--train-subset', default='all', choices=['all', 'day', 'night'])
     ap.add_argument('--epochs', type=int, default=15)
-    ap.add_argument('--batch-size', type=int, default=16)
-    ap.add_argument('--lr', type=float, default=None, help='기본: 0.02 * batch/16 (논문: 선형 스케일링)')
+    ap.add_argument('--batch-size', type=int, default=16, help='한 번에 GPU에 올리는 이미지 수')
+    ap.add_argument('--accum', type=int, default=1,
+                    help='gradient accumulation 횟수. 실질 batch = batch-size x accum (메모리 부족 시 사용)')
+    ap.add_argument('--lr', type=float, default=None, help='기본: 0.02 * 실질batch/16 (논문: 선형 스케일링)')
     ap.add_argument('--warmup', type=int, default=500)
     ap.add_argument('--workers', type=int, default=4)
     ap.add_argument('--seed', type=int, default=42)
@@ -187,7 +192,8 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     paper = args.setting == 'paper'
     amp = paper and device.type == 'cuda'
-    lr = args.lr if args.lr is not None else 0.02 * args.batch_size / 16
+    eff_batch = args.batch_size * args.accum
+    lr = args.lr if args.lr is not None else 0.02 * eff_batch / 16
     modalities = [m.strip().lower() for m in args.modalities.split(',') if m.strip()]
     out_dir = os.path.join(args.out, args.name)
     os.makedirs(out_dir, exist_ok=True)
@@ -219,15 +225,17 @@ def main():
     test_ds = ScaledDataset(base, test_files, scale)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=args.workers, collate_fn=collate_fn)
+    # 평가는 worker 없이 (1,950장이라 충분히 빠르고, 서버에서 worker 통신 에러가 났던 부분)
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
-                             num_workers=args.workers, collate_fn=collate_fn)
+                             num_workers=0, collate_fn=collate_fn)
 
     model = build_model(cfg, args.backbone, modalities, image_mean, image_std, min_size, max_size).to(device)
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
 
     info = {
         'name': args.name, 'setting': args.setting, 'backbone': args.backbone, 'modalities': modalities,
-        'train_subset': args.train_subset, 'epochs': args.epochs, 'batch_size': args.batch_size, 'lr': lr,
+        'train_subset': args.train_subset, 'epochs': args.epochs, 'batch_size': args.batch_size,
+        'accum': args.accum, 'effective_batch': eff_batch, 'lr': lr,
         'amp': amp, 'min_size': min_size, 'max_size': max_size,
         'image_mean': [round(x, 4) for x in image_mean], 'image_std': [round(x, 4) for x in image_std],
         'num_train': len(train_files), 'num_test': len(test_files), 'params_M': round(n_params, 2),
@@ -238,7 +246,9 @@ def main():
 
     # ---- optimizer / schedule: 원본 Trainer 와 동일
     optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=cfg.momentum, weight_decay=cfg.weight_decay)
-    total_steps = len(train_loader) * args.epochs
+    # step = optimizer 업데이트 횟수 (accum=1 이면 원본 Trainer 와 완전히 동일)
+    steps_per_epoch = (len(train_loader) + args.accum - 1) // args.accum
+    total_steps = steps_per_epoch * args.epochs
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, total_steps - args.warmup),
                                                            eta_min=0)
     scaler = torch.amp.GradScaler('cuda', enabled=amp)
@@ -249,16 +259,25 @@ def main():
     for epoch in range(args.epochs):
         model.train()
         ep_loss, ep_n, t_ep = 0.0, 0, time.time()
-        for images, targets in train_loader:
+        optimizer.zero_grad()
+        n_batches = len(train_loader)
+        for bi, (images, targets) in enumerate(train_loader):
             images = [im.to(device, non_blocking=True) for im in images]
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp):
                 loss_dict = model(images, targets)
                 loss = sum(loss_dict.values())
-            optimizer.zero_grad()
-            scaler.scale(loss).backward()
+            scaler.scale(loss / args.accum).backward()
+            if not torch.isfinite(loss):
+                log(f'!! loss is {loss.item()} at batch {bi + 1} (epoch {epoch + 1})')
+            ep_loss += loss.item()
+            ep_n += 1
+            if (bi + 1) % args.accum != 0 and bi + 1 != n_batches:
+                continue  # 아직 accum 횟수만큼 안 모음
+
             scaler.step(optimizer)
             scaler.update()
+            optimizer.zero_grad()
 
             step += 1
             if step <= args.warmup:
@@ -267,10 +286,6 @@ def main():
             else:
                 scheduler.step()
 
-            if not torch.isfinite(loss):
-                log(f'!! loss is {loss.item()} at step {step} (epoch {epoch + 1})')
-            ep_loss += loss.item()
-            ep_n += 1
             if step == 1 or step % args.log_every == 0:
                 el = time.time() - t_start
                 mem = torch.cuda.max_memory_allocated() / 2 ** 30 if device.type == 'cuda' else 0
@@ -289,7 +304,14 @@ def main():
 
     train_hours = (time.time() - t_start) / 3600
     log('=== EVAL ===')
-    res = evaluate(model, test_loader, test_ds.files, device, amp, args.eval_max)
+    try:
+        res = evaluate(model, test_loader, test_ds.files, device, amp, args.eval_max)
+    except Exception as e:
+        import traceback
+        log('!! EVAL FAILED: ' + f'{type(e).__name__}: {e}')
+        log(traceback.format_exc()[-3000:])
+        res = {k: {'mAP': None, 'mAP50': None} for k in ['all', 'day', 'night']}
+        res['eval_error'] = f'{type(e).__name__}: {e}'[:300]
     res.update(info)
     res['train_hours'] = round(train_hours, 3)
     res['steps'] = step
