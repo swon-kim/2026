@@ -65,7 +65,7 @@ echo "[data] $DATA : $(ls "$DATA/images" | wc -l) images, $(ls "$DATA/labels" | 
 # ---------------------------------------------------------------- 실험 1개 실행
 # MIG 18GB 메모리 기준 batch x accum (실질 batch 는 항상 16, lr 0.02)
 #   paper 설정: B0~B2 = 16x1, B3 = 8x2, B4 = 4x4
-#   code 설정(800px): 4x4
+#   code 설정(800px): 1x16 (4x4도 18GB 초과로 실패했음)
 DONE=()
 run_one() {   # run_one <실험이름>
   local name="$1" setting=paper exp="$1"
@@ -85,7 +85,7 @@ run_one() {   # run_one <실험이름>
     *) echo "[error] 알 수 없는 실험: $name"; return 1 ;;
   esac
   local bs=16 acc=1
-  if [ "$setting" = code ]; then bs=4; acc=4
+  if [ "$setting" = code ]; then bs=1; acc=16
   elif [ "$bb" = mit_b3 ]; then bs=8; acc=2
   elif [ "$bb" = mit_b4 ]; then bs=4; acc=4; fi
   local extra=()
