@@ -70,7 +70,7 @@ DONE=()
 run_one() {   # run_one <실험이름>
   local name="$1" setting=paper exp="$1"
   if [[ "$exp" == *_code ]]; then setting=code; exp="${exp%_code}"; fi
-  local bb=mit_b1 modal=rgb,thermal,event subset=all
+  local bb=mit_b1 modal=rgb,thermal,event subset=all stats=train
   case "$exp" in
     smoke)            ;;
     t1_b0|t1_b1|t1_b2|t1_b3|t1_b4) bb="mit_${exp#t1_}" ;;
@@ -79,6 +79,9 @@ run_one() {   # run_one <실험이름>
     t5_rgb_event)     modal=rgb,event ;;
     t7_day)           subset=day ;;
     t7_night)         subset=night ;;
+    # 정규화 통계를 학습 split 전체(7,800장)로 고정한 버전
+    t7_day_fs)        subset=day;   stats=train_all ;;
+    t7_night_fs)      subset=night; stats=train_all ;;
     *) echo "[error] 알 수 없는 실험: $name"; return 1 ;;
   esac
   local bs=16 acc=1
@@ -89,9 +92,9 @@ run_one() {   # run_one <실험이름>
   if [ "$exp" = smoke ]; then extra=(--epochs 1 --max-steps 20 --eval-max 64 --stats-samples 50 --no-save); fi
 
   echo ""
-  echo "################ START $name  ($(date '+%m-%d %H:%M'))  backbone=$bb modal=$modal train=$subset setting=$setting batch=${bs}x${acc}"
+  echo "################ START $name  ($(date '+%m-%d %H:%M'))  backbone=$bb modal=$modal train=$subset setting=$setting batch=${bs}x${acc} stats=$stats"
   if python -u scripts/run_experiment.py --data "$DATA" --out "$OUT_ROOT" --name "$name" \
-       --setting "$setting" --backbone "$bb" --modalities "$modal" --train-subset "$subset" \
+       --setting "$setting" --backbone "$bb" --modalities "$modal" --train-subset "$subset" --stats-from "$stats" \
        --batch-size "$bs" --accum "$acc" --log-every "$LOG_EVERY" "${extra[@]}"; then
     echo "################ END $name OK"
   else
@@ -107,6 +110,7 @@ case "$EXP" in
   t1_large) LIST=(t1_b3 t1_b4) ;;
   t5_all)   LIST=(t5_rgb_thermal t5_thermal_event t5_rgb_event) ;;
   t7_all)   LIST=(t7_day t7_night) ;;
+  t7_all_fs) LIST=(t7_day_fs t7_night_fs) ;;
   *)        LIST=("$EXP") ;;
 esac
 if [ "$EXP" = smoke ]; then
