@@ -67,9 +67,14 @@ echo "[data] $DATA : $(ls "$DATA/images" | wc -l) images, $(ls "$DATA/labels" | 
 #   paper 설정: B0~B2 = 16x1, B3 = 8x2, B4 = 4x4
 #   code 설정(800px): 1x16 (4x4도 18GB 초과로 실패했음)
 DONE=()
+#   이름 뒤 _code : 공개 코드 그대로 설정
+#   이름 뒤 _an   : 분석 출력 추가 (예측 통계 / 센서 끄고 채점 / MAGE 가중치)
+#   이름 뒤 _sN   : 학습 seed = N (기본 42, train/test 분할은 항상 42 고정)
 run_one() {   # run_one <실험이름>
-  local name="$1" setting=paper exp="$1"
+  local name="$1" setting=paper exp="$1" seed=42 analyze=()
   if [[ "$exp" == *_code ]]; then setting=code; exp="${exp%_code}"; fi
+  if [[ "$exp" == *_an ]]; then analyze=(--analyze); exp="${exp%_an}"; fi
+  if [[ "$exp" =~ ^(.+)_s([0-9]+)$ ]]; then exp="${BASH_REMATCH[1]}"; seed="${BASH_REMATCH[2]}"; fi
   local bb=mit_b1 modal=rgb,thermal,event subset=all stats=train
   case "$exp" in
     smoke)            ;;
@@ -77,7 +82,12 @@ run_one() {   # run_one <실험이름>
     t5_rgb_thermal)   modal=rgb,thermal ;;
     t5_thermal_event) modal=thermal,event ;;
     t5_rgb_event)     modal=rgb,event ;;
+    # 센서 1개
+    t5_rgb)           modal=rgb ;;
+    t5_thermal)       modal=thermal ;;
+    t5_event)         modal=event ;;
     t7_day)           subset=day ;;
+    t7_day_thermal)   subset=day; modal=thermal ;;
     t7_night)         subset=night ;;
     # 정규화 통계를 학습 split 전체(7,800장)로 고정한 버전
     t7_day_fs)        subset=day;   stats=train_all ;;
@@ -92,10 +102,10 @@ run_one() {   # run_one <실험이름>
   if [ "$exp" = smoke ]; then extra=(--epochs 1 --max-steps 20 --eval-max 64 --stats-samples 50 --no-save); fi
 
   echo ""
-  echo "################ START $name  ($(date '+%m-%d %H:%M'))  backbone=$bb modal=$modal train=$subset setting=$setting batch=${bs}x${acc} stats=$stats"
+  echo "################ START $name  ($(date '+%m-%d %H:%M'))  backbone=$bb modal=$modal train=$subset setting=$setting batch=${bs}x${acc} stats=$stats seed=$seed ${analyze[*]}"
   if python -u scripts/run_experiment.py --data "$DATA" --out "$OUT_ROOT" --name "$name" \
        --setting "$setting" --backbone "$bb" --modalities "$modal" --train-subset "$subset" --stats-from "$stats" \
-       --batch-size "$bs" --accum "$acc" --log-every "$LOG_EVERY" "${extra[@]}"; then
+       --batch-size "$bs" --accum "$acc" --seed "$seed" --log-every "$LOG_EVERY" "${extra[@]}" "${analyze[@]}"; then
     echo "################ END $name OK"
   else
     echo "################ END $name FAILED (다음 실험으로 진행)"
@@ -111,6 +121,13 @@ case "$EXP" in
   t5_all)   LIST=(t5_rgb_thermal t5_thermal_event t5_rgb_event) ;;
   t7_all)   LIST=(t7_day t7_night) ;;
   t7_all_fs) LIST=(t7_day_fs t7_night_fs) ;;
+  # ---- 11/24 회의 후속 (이슈 5개로 나눠 제출)
+  wk_seed_tri)  LIST=(t1_b1_s1 t1_b1_s2) ;;                   # 3센서 seed 반복
+  wk_seed_rgbt) LIST=(t5_rgb_thermal_s1 t5_rgb_thermal_s2) ;; # RGB+열화상 seed 반복
+  wk_single)    LIST=(t5_rgb t5_thermal t5_event) ;;          # 센서 1개
+  wk_analysis)  LIST=(t1_b1_an) ;;                            # 3센서 분석 (모델 저장)
+  wk_t7)        LIST=(t7_day_an t7_day_thermal) ;;            # Table 7 원인 확인
+  smoke_an)     LIST=(smoke_an) ; LOG_EVERY=5 ;;              # 분석 기능 시험 (20스텝)
   *)        LIST=("$EXP") ;;
 esac
 if [ "$EXP" = smoke ]; then
