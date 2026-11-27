@@ -20,6 +20,13 @@
   500 iter linear warmup + cosine, 80/20 무작위 분할(seed 42), MAGE+BiTE, FPN + Faster R-CNN
 
 평가: COCO mAP / mAP50 을 전체(All), frame_(밝은 영상), nframe_(어두운 영상) 별로 출력.
+
+--analyze (11/24 회의 후속 분석, 학습은 그대로이고 평가 뒤에 아래를 추가로 출력):
+  1) 예측 통계 : 낮/밤 test 에서 모델이 낸 박스 수, 점수 분포 (못 찾는지 / 엉뚱한 걸 찾는지)
+  2) 센서 끄고 채점 : 학습된 모델에서 시험 때 RGB / 열화상 / 이벤트를 하나씩 0으로 끄고 다시 채점
+                     (원본 ablation 코드와 같은 방식: 정규화된 입력 채널을 0으로)
+  3) MAGE 가중치 : stage 1~4 별로 MAGE 가 두 갈래(RGB / 열화상+이벤트) 사이에 주고받는
+                   gate 값 평균과 각 갈래 feature 크기 (낮/밤 따로)
 """
 import argparse
 import copy
@@ -122,29 +129,139 @@ def build_model(cfg, backbone_name, modalities, image_mean, image_std, min_size,
 
 
 # --------------------------------------------------------------------------- eval
-def evaluate(model, loader, files, device, amp, max_images=None):
+MODALITY_CHANNELS = {'rgb': [0, 1, 2], 'thermal': [3], 'event': [4]}
+
+
+def subsets_of(fname):
+    return ['all'] + [sub for sub, prefix in SUBSETS.items() if fname.startswith(prefix)]
+
+
+def add_drop_hook(model, drop):
+    """시험 때 센서 끄기: backbone 에 들어가는 (정규화된) 입력의 해당 채널을 0으로."""
+    ch = sum((MODALITY_CHANNELS[m] for m in drop), [])
+
+    def pre(_mod, args):
+        x = args[0].clone()
+        x[:, ch] = 0
+        return (x,) + tuple(args[1:])
+    return model.backbone.register_forward_pre_hook(pre)
+
+
+class MageProbe:
+    """MAGE 가 주고받는 gate 값과 두 갈래 feature 크기를 stage 별, 낮/밤 별로 평균낸다.
+
+    MAGE: out_rgb = rgb + 0.5*ch[1]*x + 0.5*sp[1]*x   (x -> rgb 로 넘어가는 양)
+          out_x   = x   + 0.5*ch[0]*rgb + 0.5*sp[0]*rgb (rgb -> x 로 넘어가는 양)
+    x = 열화상+이벤트 갈래
+    """
+
+    def __init__(self, encoder):
+        self.cur = None          # 지금 배치의 이미지별 subset 목록
+        self.sums = {}
+        self.handles = []
+        for i, mage in enumerate(encoder.MAGEs):
+            self.handles.append(mage.channel_weights.register_forward_hook(self._gate_hook(i, 'ch')))
+            self.handles.append(mage.spatial_weights.register_forward_hook(self._gate_hook(i, 'sp')))
+            self.handles.append(mage.register_forward_hook(self._input_hook(i)))
+
+    def _add(self, stage, key, per_sample):
+        if self.cur is None:
+            return
+        for b, v in enumerate(per_sample.tolist()):
+            if b >= len(self.cur):
+                break
+            for sub in self.cur[b]:
+                s = self.sums.setdefault((sub, stage, key), [0.0, 0])
+                s[0] += v
+                s[1] += 1
+
+    def _gate_hook(self, i, kind):
+        def hook(_mod, _inp, out):
+            w = out.detach().float()          # (2, B, ...)
+            B = w.shape[1]
+            self._add(i, f'{kind}_rgb2x', w[0].reshape(B, -1).mean(1))
+            self._add(i, f'{kind}_x2rgb', w[1].reshape(B, -1).mean(1))
+        return hook
+
+    def _input_hook(self, i):
+        def hook(_mod, inp, _out):
+            x1, x2 = inp[0].detach().float(), inp[1].detach().float()
+            B = x1.shape[0]
+            self._add(i, 'feat_rgb', x1.abs().reshape(B, -1).mean(1))
+            self._add(i, 'feat_x', x2.abs().reshape(B, -1).mean(1))
+        return hook
+
+    def result(self):
+        out = {}
+        for (sub, stage, key), (s, n) in sorted(self.sums.items()):
+            out.setdefault(sub, {}).setdefault(f'stage{stage + 1}', {})[key] = round(s / max(n, 1), 4)
+        return out
+
+    def remove(self):
+        for h in self.handles:
+            h.remove()
+
+
+def new_pred_stats():
+    return {'images': 0, 'gt_boxes': 0, 'pred_boxes': 0, 'pred_ge0.5': 0, 'images_no_pred_ge0.5': 0,
+            'score_hist': [0] * 10, 'max_score_sum': 0.0}
+
+
+def finish_pred_stats(s):
+    n = max(s['images'], 1)
+    return {'images': s['images'],
+            'gt_per_img': round(s['gt_boxes'] / n, 2),
+            'pred_per_img': round(s['pred_boxes'] / n, 2),
+            'pred_ge0.5_per_img': round(s['pred_ge0.5'] / n, 2),
+            'images_no_pred_ge0.5': s['images_no_pred_ge0.5'],
+            'mean_max_score': round(s['max_score_sum'] / n, 3),
+            'score_hist_0.0to1.0': s['score_hist']}
+
+
+def evaluate(model, loader, files, device, amp, max_images=None, drop=None, probe=None, pred_stats=False):
     from torchmetrics.detection import MeanAveragePrecision
     metrics = {k: MeanAveragePrecision(box_format='xyxy') for k in ['all', 'day', 'night']}
+    stats = {k: new_pred_stats() for k in ['all', 'day', 'night']}
+    handle = add_drop_hook(model, drop) if drop else None
     model.eval()
     seen = 0
-    with torch.no_grad():
-        for images, targets in loader:
-            images = [im.to(device) for im in images]
-            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp):
-                preds = model(images)
-            for p, t in zip(preds, targets):
+    try:
+        with torch.no_grad():
+            for images, targets in loader:
+                images = [im.to(device) for im in images]
+                if probe is not None:
+                    probe.cur = [subsets_of(f) for f in files[seen:seen + len(images)]]
+                with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp):
+                    preds = model(images)
+                for p, t in zip(preds, targets):
+                    if max_images is not None and seen >= max_images:
+                        break
+                    p = {'boxes': p['boxes'].float().cpu(), 'scores': p['scores'].float().cpu(),
+                         'labels': p['labels'].long().cpu()}
+                    subs = subsets_of(files[seen])
+                    for sub in subs:
+                        metrics[sub].update([p], [t])
+                    if pred_stats:
+                        sc = p['scores']
+                        for sub in subs:
+                            s = stats[sub]
+                            s['images'] += 1
+                            s['gt_boxes'] += len(t['boxes'])
+                            s['pred_boxes'] += len(sc)
+                            n_hi = int((sc >= 0.5).sum())
+                            s['pred_ge0.5'] += n_hi
+                            s['images_no_pred_ge0.5'] += int(n_hi == 0)
+                            s['max_score_sum'] += float(sc.max()) if len(sc) else 0.0
+                            for v in sc.tolist():
+                                s['score_hist'][min(int(v * 10), 9)] += 1
+                    seen += 1
                 if max_images is not None and seen >= max_images:
                     break
-                p = {'boxes': p['boxes'].float().cpu(), 'scores': p['scores'].float().cpu(),
-                     'labels': p['labels'].long().cpu()}
-                fname = files[seen]
-                metrics['all'].update([p], [t])
-                for sub, prefix in SUBSETS.items():
-                    if fname.startswith(prefix):
-                        metrics[sub].update([p], [t])
-                seen += 1
-            if max_images is not None and seen >= max_images:
-                break
+    finally:
+        if handle is not None:
+            handle.remove()
+        if probe is not None:
+            probe.cur = None
     out = {}
     for k, m in metrics.items():
         try:
@@ -154,7 +271,50 @@ def evaluate(model, loader, files, device, amp, max_images=None):
             log(f'!! METRIC ERROR [{k}]: {type(e).__name__}: {e}')
             out[k] = {'mAP': None, 'mAP50': None, 'note': str(e)[:200]}
     out['num_test_images'] = seen
+    if pred_stats:
+        out['pred_stats'] = {k: finish_pred_stats(v) for k, v in stats.items()}
     return out
+
+
+def run_analysis(model, loader, files, device, amp, max_images, modalities, res):
+    """--analyze: 센서 끄고 채점 (예측 통계와 MAGE 값은 본 평가에서 이미 수집)."""
+    drops = [[m] for m in modalities] if len(modalities) > 1 else []
+    if set(modalities) == {'rgb', 'thermal', 'event'}:
+        drops.append(['thermal', 'event'])   # RGB 갈래만 남기기
+    res['drop_eval'] = {}
+    for d in drops:
+        key = 'no_' + '+'.join(d)
+        log(f'=== DROP EVAL: {key} ===')
+        try:
+            r = evaluate(model, loader, files, device, amp, max_images, drop=d)
+            res['drop_eval'][key] = {k: r[k] for k in ['all', 'day', 'night']}
+        except Exception as e:
+            log(f'!! DROP EVAL FAILED [{key}]: {type(e).__name__}: {e}')
+            res['drop_eval'][key] = {'error': f'{type(e).__name__}: {e}'[:300]}
+
+
+def print_analysis(res):
+    log('=== ANALYSIS ===')
+    if 'pred_stats' in res:
+        log('[예측 통계] 이미지당 정답 박스 / 예측 박스(전체, 점수>=0.5) / 점수>=0.5 예측이 없는 이미지 수 / 평균 최고점수')
+        for k, s in res['pred_stats'].items():
+            log(f"  {k:5s}: imgs {s['images']}  gt {s['gt_per_img']}  pred {s['pred_per_img']} "
+                f"(>=0.5: {s['pred_ge0.5_per_img']})  no_pred {s['images_no_pred_ge0.5']}  "
+                f"max_score {s['mean_max_score']}  hist {s['score_hist_0.0to1.0']}")
+    if res.get('drop_eval'):
+        log('[센서 끄고 채점] mAP all / day / night')
+        log(f"  {'none (기본)':16s}: {res['all']['mAP']} / {res['day']['mAP']} / {res['night']['mAP']}")
+        for key, r in res['drop_eval'].items():
+            if 'error' in r:
+                log(f'  {key:16s}: ERROR {r["error"]}')
+            else:
+                log(f"  {key:16s}: {r['all']['mAP']} / {r['day']['mAP']} / {r['night']['mAP']}")
+    if 'mage' in res:
+        log('[MAGE] stage별 평균: ch/sp_rgb2x = RGB->열화상+이벤트 gate, ch/sp_x2rgb = 열화상+이벤트->RGB gate, '
+            'feat_rgb / feat_x = 각 갈래 feature 크기(|값| 평균)')
+        for sub in ['day', 'night', 'all']:
+            for st, v in res['mage'].get(sub, {}).items():
+                log(f'  {sub:5s} {st}: ' + '  '.join(f'{k} {x}' for k, x in v.items()))
 
 
 # --------------------------------------------------------------------------- main
@@ -186,6 +346,8 @@ def main():
     ap.add_argument('--max-steps', type=int, default=None, help='스모크 테스트용: 이 스텝 수만 학습')
     ap.add_argument('--eval-max', type=int, default=None, help='스모크 테스트용: 평가 이미지 수 제한')
     ap.add_argument('--no-save', action='store_true')
+    ap.add_argument('--analyze', action='store_true',
+                    help='평가 뒤 예측 통계 / 센서 끄고 채점 / MAGE 가중치 출력 (11/24 회의 후속)')
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -218,7 +380,8 @@ def main():
     # ---- normalization / resolution
     if paper:
         stats_files = train_files_all if args.stats_from == 'train_all' else train_files
-        aux_mean, aux_std = compute_aux_stats(cfg.image_dir, stats_files, args.stats_samples, args.seed)
+        # 통계용 샘플 선택은 항상 42 로 고정 -> 학습 seed 를 바꿔도 정규화 값은 같음 (seed 반복 실험용)
+        aux_mean, aux_std = compute_aux_stats(cfg.image_dir, stats_files, args.stats_samples, 42)
         image_mean = [0.485, 0.456, 0.406] + aux_mean
         image_std = [0.229, 0.224, 0.225] + aux_std
         scale, min_size, max_size = 1.0 / 255.0, 301, 391
@@ -245,7 +408,7 @@ def main():
         'image_mean': [round(x, 4) for x in image_mean], 'image_std': [round(x, 4) for x in image_std],
         'num_train': len(train_files), 'num_test': len(test_files), 'params_M': round(n_params, 2),
         'device': str(device), 'gpu': torch.cuda.get_device_name(0) if device.type == 'cuda' else None,
-        'torch': torch.__version__,
+        'torch': torch.__version__, 'seed': args.seed, 'analyze': args.analyze,
     }
     log('=== CONFIG === ' + json.dumps(info, ensure_ascii=False))
 
@@ -309,14 +472,21 @@ def main():
 
     train_hours = (time.time() - t_start) / 3600
     log('=== EVAL ===')
+    probe = MageProbe(model.backbone.encoder) if args.analyze else None
     try:
-        res = evaluate(model, test_loader, test_ds.files, device, amp, args.eval_max)
+        res = evaluate(model, test_loader, test_ds.files, device, amp, args.eval_max,
+                       probe=probe, pred_stats=args.analyze)
     except Exception as e:
         import traceback
         log('!! EVAL FAILED: ' + f'{type(e).__name__}: {e}')
         log(traceback.format_exc()[-3000:])
         res = {k: {'mAP': None, 'mAP50': None} for k in ['all', 'day', 'night']}
         res['eval_error'] = f'{type(e).__name__}: {e}'[:300]
+    if probe is not None:
+        res['mage'] = probe.result()
+        probe.remove()
+    if args.analyze and 'eval_error' not in res:
+        run_analysis(model, test_loader, test_ds.files, device, amp, args.eval_max, modalities, res)
     res.update(info)
     res['train_hours'] = round(train_hours, 3)
     res['steps'] = step
@@ -328,6 +498,8 @@ def main():
         f"train={args.train_subset} | params {n_params:.2f}M | {train_hours:.2f}h")
     for k in ['all', 'day', 'night']:
         log(f"  {k:5s}: mAP {res[k]['mAP']}  mAP50 {res[k]['mAP50']}")
+    if args.analyze:
+        print_analysis(res)
     log('RESULT_JSON ' + json.dumps(res, ensure_ascii=False))
 
 
