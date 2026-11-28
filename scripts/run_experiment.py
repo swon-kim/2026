@@ -27,6 +27,14 @@
                      (원본 ablation 코드와 같은 방식: 정규화된 입력 채널을 0으로)
   3) MAGE 가중치 : stage 1~4 별로 MAGE 가 두 갈래(RGB / 열화상+이벤트) 사이에 주고받는
                    gate 값 평균과 각 갈래 feature 크기 (낮/밤 따로)
+  4) [11/28 추가] Table 7 0점대 원인 진단 (재학습 없이 같은 모델로 다시 채점)
+     a) 문턱값 낮추기 : torchvision 기본 score_thresh 0.05 -> 0.001 로 낮춰 다시 채점.
+                        + 점수와 상관없이 정답 박스 근처(IoU>=0.5)에 예측이 있는 비율(recall)과
+                          그 예측의 점수 분포 -> "못 찾는 것" vs "찾는데 확신이 낮아 버려지는 것"
+     b) AdaBN       : 낮만(밤만) 학습 모델의 BatchNorm 통계(평균/분산)만 반대 조건 사진으로 다시 계산.
+                        사진은 학습 split 의 반대 조건 이미지(라벨 사용 안 함, test 사진 사용 안 함).
+                        가중치는 그대로. 점수가 크게 오르면 "BatchNorm 영점이 학습 조건에 고정된 것"이 원인.
+                        (--train-subset day/night 일 때만 실행)
 """
 import argparse
 import copy
@@ -43,7 +51,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 from torchvision.models.detection.faster_rcnn import FasterRCNN
 from torchvision.models.detection.rpn import AnchorGenerator
-from torchvision.ops import MultiScaleRoIAlign
+from torchvision.ops import MultiScaleRoIAlign, box_iou
 
 from trimodaldet.config import Config
 from trimodaldet.data.dataset import NpyYoloDataset, collate_fn
@@ -218,10 +226,45 @@ def finish_pred_stats(s):
             'score_hist_0.0to1.0': s['score_hist']}
 
 
-def evaluate(model, loader, files, device, amp, max_images=None, drop=None, probe=None, pred_stats=False):
+def new_match_stats():
+    return {'gt': 0, 'found': 0, 'scores': []}
+
+
+def finish_match_stats(s, low_thresh):
+    sc = np.array(s['scores'], dtype=np.float64)
+    out = {'gt_boxes': s['gt'],
+           'recall50_any_score': round(100.0 * s['found'] / max(s['gt'], 1), 2)}
+    if len(sc):
+        out.update({'matched_score_median': round(float(np.median(sc)), 4),
+                    'matched_score_mean': round(float(sc.mean()), 4),
+                    'matched_below_0.05_pct': round(100.0 * float((sc < 0.05).mean()), 2),
+                    'matched_ge_0.5_pct': round(100.0 * float((sc >= 0.5).mean()), 2)})
+    return out
+
+
+def update_match_stats(mstats, subs, p, t):
+    """정답 박스마다 IoU>=0.5 인 예측이 하나라도 있는지(점수 무관)와, 있으면 그중 최고 점수를 모은다."""
+    gt = t['boxes'].float()
+    for sub in subs:
+        mstats[sub]['gt'] += len(gt)
+    if len(gt) == 0 or len(p['boxes']) == 0:
+        return
+    iou = box_iou(gt, p['boxes'])                       # (G, P)
+    hit = iou >= 0.5
+    found = hit.any(1)
+    best = torch.where(hit, p['scores'].unsqueeze(0).expand_as(iou), torch.zeros_like(iou)).max(1).values
+    sc = best[found].tolist()
+    for sub in subs:
+        mstats[sub]['found'] += int(found.sum())
+        mstats[sub]['scores'].extend(sc)
+
+
+def evaluate(model, loader, files, device, amp, max_images=None, drop=None, probe=None, pred_stats=False,
+             match_stats=False):
     from torchmetrics.detection import MeanAveragePrecision
     metrics = {k: MeanAveragePrecision(box_format='xyxy') for k in ['all', 'day', 'night']}
     stats = {k: new_pred_stats() for k in ['all', 'day', 'night']}
+    mstats = {k: new_match_stats() for k in ['all', 'day', 'night']}
     handle = add_drop_hook(model, drop) if drop else None
     model.eval()
     seen = 0
@@ -254,6 +297,8 @@ def evaluate(model, loader, files, device, amp, max_images=None, drop=None, prob
                             s['max_score_sum'] += float(sc.max()) if len(sc) else 0.0
                             for v in sc.tolist():
                                 s['score_hist'][min(int(v * 10), 9)] += 1
+                    if match_stats:
+                        update_match_stats(mstats, subs, p, t)
                     seen += 1
                 if max_images is not None and seen >= max_images:
                     break
@@ -273,7 +318,135 @@ def evaluate(model, loader, files, device, amp, max_images=None, drop=None, prob
     out['num_test_images'] = seen
     if pred_stats:
         out['pred_stats'] = {k: finish_pred_stats(v) for k, v in stats.items()}
+    if match_stats:
+        thr = float(getattr(model.roi_heads, 'score_thresh', float('nan')))
+        out['score_thresh'] = thr
+        out['match'] = {k: finish_match_stats(v, thr) for k, v in mstats.items()}
     return out
+
+
+# --------------------------------------------------------------------------- 11/28 진단 (Table 7)
+def evaluate_with_thresh(model, thresh, *eval_args, **eval_kwargs):
+    """roi_heads.score_thresh 를 잠시 바꿔서 채점하고 원래 값으로 되돌린다."""
+    old = model.roi_heads.score_thresh
+    model.roi_heads.score_thresh = thresh
+    try:
+        return evaluate(model, *eval_args, **eval_kwargs)
+    finally:
+        model.roi_heads.score_thresh = old
+
+
+def adabn_copy(model, loader, device, amp):
+    """AdaBN: 모델을 복사해서 BatchNorm 의 running mean/var 만 loader 사진들로 다시 계산한다.
+    가중치(학습된 값)는 그대로, 라벨도 쓰지 않는다. 반환: (적응된 모델 복사본, BN 층 수, 사용한 사진 수)"""
+    m = copy.deepcopy(model)
+    bns = [x for x in m.modules() if isinstance(x, torch.nn.modules.batchnorm._BatchNorm)]
+    if not bns:
+        return None, 0, 0
+    for bn in bns:
+        bn.reset_running_stats()
+        bn.momentum = None            # None = 들어온 배치들의 누적 평균
+    m.eval()                          # 검출기는 평가 모드 (정답 필요 없음)
+    for bn in bns:
+        bn.train()                    # BatchNorm 만 통계 갱신 모드
+    n = 0
+    with torch.no_grad():
+        for images, _ in loader:
+            images = [im.to(device) for im in images]
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp):
+                m(images)
+            n += len(images)
+    m.eval()
+    return m, len(bns), n
+
+
+def run_diagnostics(model, test_loader, files, device, amp, max_images, res, args, base, scale,
+                    train_files_all):
+    """Table 7 0점대 원인 진단: (a) 문턱값 낮추기, (b) AdaBN. 실패해도 본 결과에는 영향 없음."""
+    diag = res.setdefault('diag', {})
+    low = args.low_thresh
+    eval_args = (test_loader, files, device, amp, max_images)
+
+    # (a) 문턱값 낮추기
+    log(f'=== DIAG (a): score_thresh {model.roi_heads.score_thresh} -> {low} 로 다시 채점 ===')
+    try:
+        r = evaluate_with_thresh(model, low, *eval_args, match_stats=True)
+        diag['low_thresh'] = {k: r[k] for k in ['all', 'day', 'night']}
+        diag['low_thresh']['match'] = r['match']
+    except Exception as e:
+        log(f'!! DIAG (a) FAILED: {type(e).__name__}: {e}')
+        diag['low_thresh'] = {'error': f'{type(e).__name__}: {e}'[:300]}
+
+    # (b) AdaBN (낮만/밤만 학습일 때만)
+    if args.train_subset == 'all':
+        diag['adabn'] = {'skipped': 'train_subset=all (전체 학습 모델은 대상 아님)'}
+        return
+    target = 'night' if args.train_subset == 'day' else 'day'
+    adapt_pool = [f for f in train_files_all if f.startswith(SUBSETS[target])]
+    rng = random.Random(42)
+    adapt_files = rng.sample(adapt_pool, min(args.adabn_samples, len(adapt_pool)))
+    log(f'=== DIAG (b): AdaBN -> BatchNorm 통계를 학습 split 의 {target} 사진 {len(adapt_files)}장으로 다시 계산 ===')
+    try:
+        adapt_ds = ScaledDataset(base, adapt_files, scale)
+        adapt_loader = DataLoader(adapt_ds, batch_size=args.batch_size, shuffle=False, num_workers=0,
+                                  collate_fn=collate_fn)
+        m2, n_bn, n_img = adabn_copy(model, adapt_loader, device, amp)
+        if m2 is None:
+            diag['adabn'] = {'skipped': 'BatchNorm 층 없음'}
+            return
+        out = {'target': target, 'bn_layers': n_bn, 'adapt_images': n_img}
+        r = evaluate(m2, *eval_args, match_stats=True)
+        out['default_thresh'] = {k: r[k] for k in ['all', 'day', 'night']}
+        out['default_thresh']['match'] = r['match']
+        r = evaluate_with_thresh(m2, low, *eval_args, match_stats=True)
+        out['low_thresh'] = {k: r[k] for k in ['all', 'day', 'night']}
+        out['low_thresh']['match'] = r['match']
+        diag['adabn'] = out
+        del m2
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+    except Exception as e:
+        import traceback
+        log(f'!! DIAG (b) FAILED: {type(e).__name__}: {e}')
+        log(traceback.format_exc()[-2000:])
+        diag['adabn'] = {'error': f'{type(e).__name__}: {e}'[:300]}
+
+
+def print_diag(res):
+    d = res.get('diag')
+    if not d:
+        return
+    log('=== DIAG (Table 7 원인 진단) ===')
+    log('mAP / mAP50 (all | day | night),  recall50 = 정답 박스 근처(IoU>=0.5)에 예측이 있는 비율(점수 무관)')
+
+    def row(label, r):
+        if r is None:
+            return
+        if 'error' in r or 'skipped' in r:
+            log(f"  {label:28s}: {r.get('error') or r.get('skipped')}")
+            return
+        mAP = ' | '.join(f"{r[k]['mAP']}/{r[k]['mAP50']}" for k in ['all', 'day', 'night'])
+        log(f'  {label:28s}: {mAP}')
+        for k in ['day', 'night']:
+            m = r.get('match', {}).get(k)
+            if m:
+                extra = ''
+                if 'matched_score_median' in m:
+                    extra = (f"  찾은 박스 점수 중앙값 {m['matched_score_median']}"
+                             f"  (0.05 미만 {m['matched_below_0.05_pct']}%, 0.5 이상 {m['matched_ge_0.5_pct']}%)")
+                log(f"      {k:5s} recall50 {m['recall50_any_score']}%{extra}")
+
+    base = {k: res[k] for k in ['all', 'day', 'night']}
+    base['match'] = res.get('match_default', {})
+    row('기본 (score_thresh 0.05)', base)
+    row(f"문턱값 {res.get('low_thresh_value', '')}", d.get('low_thresh'))
+    a = d.get('adabn', {})
+    if 'default_thresh' in a:
+        log(f"  AdaBN: {a['target']} 사진 {a['adapt_images']}장으로 BatchNorm {a['bn_layers']}개 층 통계 재계산")
+        row('AdaBN (0.05)', a['default_thresh'])
+        row('AdaBN + 문턱값 낮춤', a['low_thresh'])
+    else:
+        row('AdaBN', a)
 
 
 def run_analysis(model, loader, files, device, amp, max_images, modalities, res):
@@ -347,7 +520,9 @@ def main():
     ap.add_argument('--eval-max', type=int, default=None, help='스모크 테스트용: 평가 이미지 수 제한')
     ap.add_argument('--no-save', action='store_true')
     ap.add_argument('--analyze', action='store_true',
-                    help='평가 뒤 예측 통계 / 센서 끄고 채점 / MAGE 가중치 출력 (11/24 회의 후속)')
+                    help='평가 뒤 예측 통계 / 센서 끄고 채점 / MAGE 가중치 / Table 7 진단(문턱값, AdaBN) 출력')
+    ap.add_argument('--low-thresh', type=float, default=0.001, help='진단 (a): 낮춘 score_thresh')
+    ap.add_argument('--adabn-samples', type=int, default=512, help='진단 (b): AdaBN 에 쓰는 반대 조건 사진 수')
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -475,23 +650,42 @@ def main():
     probe = MageProbe(model.backbone.encoder) if args.analyze else None
     try:
         res = evaluate(model, test_loader, test_ds.files, device, amp, args.eval_max,
-                       probe=probe, pred_stats=args.analyze)
+                       probe=probe, pred_stats=args.analyze, match_stats=args.analyze)
     except Exception as e:
         import traceback
         log('!! EVAL FAILED: ' + f'{type(e).__name__}: {e}')
         log(traceback.format_exc()[-3000:])
         res = {k: {'mAP': None, 'mAP50': None} for k in ['all', 'day', 'night']}
         res['eval_error'] = f'{type(e).__name__}: {e}'[:300]
+    if 'match' in res:
+        res['match_default'] = res.pop('match')
     if probe is not None:
         res['mage'] = probe.result()
         probe.remove()
-    if args.analyze and 'eval_error' not in res:
-        run_analysis(model, test_loader, test_ds.files, device, amp, args.eval_max, modalities, res)
     res.update(info)
     res['train_hours'] = round(train_hours, 3)
     res['steps'] = step
-    with open(os.path.join(out_dir, 'results.json'), 'w', encoding='utf-8') as f:
-        json.dump(res, f, indent=2, ensure_ascii=False)
+
+    def save_results():
+        with open(os.path.join(out_dir, 'results.json'), 'w', encoding='utf-8') as f:
+            json.dump(res, f, indent=2, ensure_ascii=False)
+
+    # 본 채점 결과를 분석 전에 먼저 출력/저장 (분석 중 문제가 생겨도 본 결과는 남도록)
+    log('=== EVAL RESULT (본 채점) === ' + '  '.join(
+        f"{k} {res[k]['mAP']}/{res[k]['mAP50']}" for k in ['all', 'day', 'night']))
+    save_results()
+    if args.analyze and 'eval_error' not in res:
+        try:
+            run_analysis(model, test_loader, test_ds.files, device, amp, args.eval_max, modalities, res)
+        except Exception as e:
+            log(f'!! ANALYSIS FAILED: {type(e).__name__}: {e}')
+        res['low_thresh_value'] = args.low_thresh
+        try:
+            run_diagnostics(model, test_loader, test_ds.files, device, amp, args.eval_max, res, args,
+                            base, scale, train_files_all)
+        except Exception as e:
+            log(f'!! DIAG FAILED: {type(e).__name__}: {e}')
+        save_results()
 
     log('=== RESULT ===')
     log(f"{args.name} | setting={args.setting} backbone={args.backbone} modal={'+'.join(modalities)} "
@@ -500,6 +694,7 @@ def main():
         log(f"  {k:5s}: mAP {res[k]['mAP']}  mAP50 {res[k]['mAP50']}")
     if args.analyze:
         print_analysis(res)
+        print_diag(res)
     log('RESULT_JSON ' + json.dumps(res, ensure_ascii=False))
 
 
