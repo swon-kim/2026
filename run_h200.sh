@@ -68,7 +68,7 @@ echo "[data] $DATA : $(ls "$DATA/images" | wc -l) images, $(ls "$DATA/labels" | 
 #   code 설정(800px): 1x16 (4x4도 18GB 초과로 실패했음)
 DONE=()
 #   이름 뒤 _code : 공개 코드 그대로 설정
-#   이름 뒤 _an   : 분석 출력 추가 (예측 통계 / 센서 끄고 채점 / MAGE 가중치)
+#   이름 뒤 _an   : 분석 출력 추가 (예측 통계 / 센서 끄고 채점 / MAGE 가중치 / 문턱값 낮춰 재채점 / AdaBN)
 #   이름 뒤 _sN   : 학습 seed = N (기본 42, train/test 분할은 항상 42 고정)
 run_one() {   # run_one <실험이름>
   local name="$1" setting=paper exp="$1" seed=42 analyze=()
@@ -78,6 +78,7 @@ run_one() {   # run_one <실험이름>
   local bb=mit_b1 modal=rgb,thermal,event subset=all stats=train
   case "$exp" in
     smoke)            ;;
+    smoke_t7)         subset=day ;;   # 진단 기능 시험용 (낮만 학습 20스텝)
     t1_b0|t1_b1|t1_b2|t1_b3|t1_b4) bb="mit_${exp#t1_}" ;;
     t5_rgb_thermal)   modal=rgb,thermal ;;
     t5_thermal_event) modal=thermal,event ;;
@@ -99,7 +100,7 @@ run_one() {   # run_one <실험이름>
   elif [ "$bb" = mit_b3 ]; then bs=8; acc=2
   elif [ "$bb" = mit_b4 ]; then bs=4; acc=4; fi
   local extra=()
-  if [ "$exp" = smoke ]; then extra=(--epochs 1 --max-steps 20 --eval-max 64 --stats-samples 50 --no-save); fi
+  if [[ "$exp" == smoke* ]]; then extra=(--epochs 1 --max-steps 20 --eval-max 64 --stats-samples 50 --adabn-samples 64 --no-save); fi
 
   echo ""
   echo "################ START $name  ($(date '+%m-%d %H:%M'))  backbone=$bb modal=$modal train=$subset setting=$setting batch=${bs}x${acc} stats=$stats seed=$seed ${analyze[*]}"
@@ -111,6 +112,17 @@ run_one() {   # run_one <실험이름>
     echo "################ END $name FAILED (다음 실험으로 진행)"
   fi
   DONE+=("$name")
+}
+
+# 데이터 검사 (GPU 불필요, 몇 분): 파일 형식 / 라벨 / 밝기 / 차-주변 대비 / 분할 누수
+run_check() {
+  echo ""
+  echo "################ START data_check  ($(date '+%m-%d %H:%M'))"
+  if python -u scripts/check_data.py --data "$DATA"; then
+    echo "################ END data_check OK"
+  else
+    echo "################ END data_check FAILED (다음 실험으로 진행)"
+  fi
 }
 
 # ---------------------------------------------------------------- 실험 목록 (묶음)
@@ -128,6 +140,14 @@ case "$EXP" in
   wk_analysis)  LIST=(t1_b1_an) ;;                            # 3센서 분석 (모델 저장)
   wk_t7)        LIST=(t7_day_an t7_day_thermal) ;;            # Table 7 원인 확인
   smoke_an)     LIST=(smoke_an) ; LOG_EVERY=5 ;;              # 분석 기능 시험 (20스텝)
+  # ---- 11/28 Table 7 0점대 원인 진단 (이슈 1개로 전부)
+  #   data_check        : 데이터 검사 (형식/라벨/밝기/차-주변 대비/분할 누수), 몇 분
+  #   t7_day_an         : 낮만 학습 -> 본 채점 + 센서 끄기 + 문턱값 0.001 재채점 + AdaBN(밤 사진으로 BN 재계산)
+  #   t7_night_an       : 밤만 학습 -> 같은 진단 (AdaBN 은 낮 사진으로)
+  #   t7_day_thermal_an : 낮만 + 열화상만 학습 -> 밤에서 열화상만으로 통하는지
+  wk_t7_diag)   LIST=(data_check t7_day_an t7_night_an t7_day_thermal_an) ;;
+  smoke_diag)   LIST=(data_check smoke_t7_an) ; LOG_EVERY=5 ;;  # 위 진단 기능 시험 (20스텝)
+  data_check)   LIST=(data_check) ;;
   *)        LIST=("$EXP") ;;
 esac
 if [ "$EXP" = smoke ]; then
@@ -138,7 +158,9 @@ if [ "$EXP" = smoke ]; then
     --batch-size 4 --accum 4 --epochs 1 --max-steps 20 --eval-max 64 --stats-samples 50 --no-save --log-every 5 \
     && echo "################ END smoke_b4 OK" || echo "################ END smoke_b4 FAILED"
 else
-  for e in "${LIST[@]}"; do run_one "$e"; done
+  for e in "${LIST[@]}"; do
+    if [ "$e" = data_check ]; then run_check; else run_one "$e"; fi
+  done
 fi
 
 # ---------------------------------------------------------------- 요약표
@@ -156,5 +178,46 @@ for n in names:
     f = lambda k: f"{r[k]['mAP']}/{r[k]['mAP50']}"
     print(f"{n:22s} {f('all'):>14s} {f('day'):>14s} {f('night'):>14s}  {r.get('train_hours', '?'):>5}  "
           f"{r.get('batch_size')}x{r.get('accum', 1)}" + ("  EVAL_ERROR" if 'eval_error' in r else ""))
+
+# ---- Table 7 진단 요약 (--analyze 로 돌린 실험만)
+rows = []
+for n in names:
+    p = os.path.join(root, n, 'results.json')
+    if not os.path.exists(p):
+        continue
+    r = json.load(open(p, encoding='utf-8'))
+    d = r.get('diag')
+    if not d:
+        continue
+    def m(x, k):
+        try:
+            return f"{x[k]['mAP']}/{x[k]['mAP50']}"
+        except Exception:
+            return '-'
+    def rc(x, k):
+        try:
+            return f"{x['match'][k]['recall50_any_score']}%"
+        except Exception:
+            return '-'
+    lt, ab = d.get('low_thresh', {}), d.get('adabn', {})
+    base = {k: r[k] for k in ['all', 'day', 'night']}
+    base['match'] = r.get('match_default', {})
+    rows.append((n, '기본(0.05)', base))
+    rows.append((n, f"문턱값 {r.get('low_thresh_value', '')}", lt))
+    if 'default_thresh' in ab:
+        rows.append((n, 'AdaBN', ab['default_thresh']))
+        rows.append((n, 'AdaBN+문턱값', ab['low_thresh']))
+    for k, v in r.get('drop_eval', {}).items():
+        rows.append((n, f'센서끄기 {k}', v))
+if rows:
+    print("")
+    print("================ DIAG SUMMARY (mAP/mAP50 x100, recall50 = 점수 무관 IoU>=0.5 검출 비율) ================")
+    print(f"{'experiment':20s} {'조건':16s} {'all':>12s} {'day':>12s} {'night':>12s} {'rec_day':>8s} {'rec_night':>9s}")
+    for n, label, x in rows:
+        if not isinstance(x, dict) or 'error' in x or 'skipped' in x:
+            print(f"{n:20s} {label:16s}  {x.get('error') or x.get('skipped') if isinstance(x, dict) else x}")
+            continue
+        print(f"{n:20s} {label:16s} {m(x,'all'):>12s} {m(x,'day'):>12s} {m(x,'night'):>12s} "
+              f"{rc(x,'day'):>8s} {rc(x,'night'):>9s}")
 PY
 echo "[done] $EXP"
